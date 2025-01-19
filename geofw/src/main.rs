@@ -1,3 +1,5 @@
+mod maxmind;
+
 use anyhow::Context as _;
 use aya::{
     maps::{Queue, RingBuf},
@@ -6,12 +8,7 @@ use aya::{
 use clap::Parser;
 use log::{debug, warn};
 use maxminddb::geoip2;
-use std::{
-    fs::File,
-    io::Write,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    os::{fd::AsRawFd, unix::io::FromRawFd},
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::signal;
 
 #[derive(Debug, Parser)]
@@ -22,6 +19,11 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let maxmind_db = maxmind::MaxmindDB::new("./geofw/GeoLite2-City.mmdb");
+    println!("{:?}", maxmind_db);
+    maxmind_db.read_binary_search_tree();
+    return Ok(());
+
     let opt = Opt::parse();
 
     env_logger::init();
@@ -93,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 response
                     .push(result as u8, 0)
                     .expect("error in writing result to queue");
-                println!("wrote {} for {:?}", result, addr);
+                // println!("wrote {} for {:?}", result, addr);
             }
         }
     });
