@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         maxmind_db.data.len()
     );
 
-    // maxmind_db.read_binary_tree(0, 0);
+    maxmind_db.read_binary_tree(0, 0);
 
     let maxmind_db = maxmind::MaxmindDB::new("./geofw/GeoLite2-ASN.mmdb");
     println!("{:?}", maxmind_db);

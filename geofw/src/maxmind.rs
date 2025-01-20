@@ -4,7 +4,6 @@ use std::{
     fs::File,
     io::Read,
     net::IpAddr,
-    ops::Range,
 };
 
 const METADATA_SECTION_START: &[u8] = &[
@@ -24,17 +23,17 @@ pub struct Metadata {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum Data {
-    String(Range<usize>),
+pub enum Data<'a> {
+    String(&'a [u8]),
     Double(f64),
-    Bytes(Vec<u8>),
+    Bytes(&'a [u8]),
     U16(u16),
     U32(u32),
-    Map(FxHashMap<String, Data>),
+    Map(FxHashMap<&'a [u8], Data<'a>>),
     I32(i32),
     U64(u64),
     U128(u128),
-    Array(Vec<Data>),
+    Array(Vec<Data<'a>>),
     DataCache,
     End,
     Boolean(bool),
@@ -68,10 +67,10 @@ impl MaxmindDB {
         };
 
         let m = db.read_metadata(metadata_start);
-        let Data::U16(record_size) = *m.get("record_size").unwrap() else {
+        let Data::U16(record_size) = *m.get("record_size".as_bytes()).unwrap() else {
             unreachable!()
         };
-        let Data::U32(node_count) = *m.get("node_count").unwrap() else {
+        let Data::U32(node_count) = *m.get("node_count".as_bytes()).unwrap() else {
             unreachable!()
         };
 
@@ -84,7 +83,7 @@ impl MaxmindDB {
         db
     }
 
-    fn read_metadata(&self, metadata_start: usize) -> FxHashMap<String, Data> {
+    fn read_metadata(&self, metadata_start: usize) -> FxHashMap<&[u8], Data> {
         let (Data::Map(map), _) = self.read_data(metadata_start) else {
             unreachable!()
         };
@@ -187,21 +186,16 @@ impl MaxmindDB {
 
         match data_type {
             1 => self.follow_pointer(read_offset),
-            2 => {
-                // let value = String::from_utf8_lossy(&data[read..read + length]);
-                (
-                    Data::String(read_offset + read..read_offset + read + length),
-                    read + length,
-                )
-            }
+            2 => (
+                Data::String(&self.data[read_offset + read..read_offset + read + length]),
+                read + length,
+            ),
             3 => {
                 assert_eq!(length, 8);
 
                 (Self::read_float::<8>(data), read + length)
             }
-            4 => {
-                todo!("reached data field???");
-            }
+            4 => todo!("reached data field"),
             5 => (self.read_u16(read_offset + read, length), read + length),
             6 => (self.read_u32(read_offset + read, length), read + length),
             7 => self.read_map(read_offset, read, length),
@@ -209,9 +203,7 @@ impl MaxmindDB {
             9 => (self.read_u64(read_offset + read, length), read + length),
             10 => (self.read_u128(read_offset + read, length), read + length),
             11 => self.read_array(read_offset, read, length),
-            12 => {
-                todo!("reached data cache container");
-            }
+            12 => todo!("reached data cache container"),
             13 => (Data::End, read_offset + read),
             14 => (Data::Boolean(length == 1), read),
             15 => {
@@ -238,19 +230,16 @@ impl MaxmindDB {
             let Data::String(key) = key else {
                 unreachable!()
             };
-            let key = String::from_utf8_lossy(&self.data[key]);
 
-            map.insert(key.to_string(), value);
+            map.insert(key, value);
             length -= 1;
         }
 
         (Data::Map(map), read)
     }
 
-    fn read_array(&self, offset: usize, read: usize, length: usize) -> (Data, usize) {
-        let mut read = read;
-        let mut out = vec![];
-        let mut length = length;
+    fn read_array(&self, offset: usize, mut read: usize, mut length: usize) -> (Data, usize) {
+        let mut out = Vec::with_capacity(length);
 
         while length > 0 {
             let (value, r) = self.read_data(offset + read);
