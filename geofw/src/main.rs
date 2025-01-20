@@ -21,7 +21,39 @@ struct Opt {
 async fn main() -> anyhow::Result<()> {
     let maxmind_db = maxmind::MaxmindDB::new("./geofw/GeoLite2-City.mmdb");
     println!("{:?}", maxmind_db);
-    maxmind_db.read_binary_search_tree();
+    println!(
+        "{:?}",
+        maxmind_db.lookup(IpAddr::V6(Ipv6Addr::new(
+            // 0x2c0f, 0xfe30, 0x4000, 0, 0, 0, 0, 0,
+            0x2a0a, 0x6040, 0x4004, 0x10, 0, 0, 0, 0,
+        )))
+    );
+    println!(
+        "{} {}",
+        maxmind_db.metadata.data_section_start,
+        maxmind_db.data.len()
+    );
+
+    // maxmind_db.read_binary_tree(0, 0);
+
+    let maxmind_db = maxmind::MaxmindDB::new("./geofw/GeoLite2-ASN.mmdb");
+    println!("{:?}", maxmind_db);
+    println!(
+        "{:?}",
+        maxmind_db.lookup(IpAddr::V6(Ipv6Addr::new(
+            // 0x2c0f, 0xfe30, 0x4000, 0, 0, 0, 0, 0,
+            0x2a0a, 0x6040, 0x4004, 0x10, 0, 0, 0, 0,
+        )))
+    );
+
+    println!(
+        "{} {}",
+        maxmind_db.metadata.data_section_start,
+        maxmind_db.data.len()
+    );
+
+    maxmind_db.read_binary_tree(0, 0);
+
     return Ok(());
 
     let opt = Opt::parse();
