@@ -9,3 +9,4 @@ target/
 **/*.rs.bk
 
 **/*.mmdb
+config.json.bak

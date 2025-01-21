@@ -1,6 +1,7 @@
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
+use geofw_common::BLOCK_MARKER;
 use std::{
-    fmt::{Debug, Formatter, Result as FmtResult},
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
     fs::File,
     io::Read,
     net::IpAddr,
@@ -40,6 +41,45 @@ pub enum Data<'a> {
     Float(f32),
 }
 
+pub struct ProcessedDb {
+    pub node_count: u32,
+    pub record_size: u16,
+    pub db: Vec<u8>,
+}
+
+impl Display for Data<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Data::String(s) => f.write_str(&String::from_utf8_lossy(s)),
+            Data::Double(s) => f.write_str(&s.to_string()),
+            Data::Bytes(s) => f.write_fmt(format_args!("{:?}", s)),
+            Data::U16(s) => f.write_str(&s.to_string()),
+            Data::U32(s) => f.write_str(&s.to_string()),
+            Data::Map(hash_map) => {
+                for (k, v) in hash_map {
+                    f.write_fmt(format_args!("{} => {}\n", String::from_utf8_lossy(k), v))
+                        .expect("error in writing hashmap entry");
+                }
+                Ok(())
+            }
+            Data::I32(s) => f.write_str(&s.to_string()),
+            Data::U64(s) => f.write_str(&s.to_string()),
+            Data::U128(s) => f.write_str(&s.to_string()),
+            Data::Array(vec) => {
+                for (i, v) in vec.iter().enumerate() {
+                    f.write_fmt(format_args!("index = {} value = {}\n", i, v))
+                        .expect("error in writing array");
+                }
+                Ok(())
+            }
+            Data::DataCache => todo!(),
+            Data::End => f.write_str("END"),
+            Data::Boolean(s) => f.write_str(&s.to_string()),
+            Data::Float(s) => f.write_str(&s.to_string()),
+        }
+    }
+}
+
 impl Debug for MaxmindDB {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         f.write_fmt(format_args!("{:?}", self.metadata))
@@ -47,14 +87,14 @@ impl Debug for MaxmindDB {
 }
 
 impl MaxmindDB {
-    pub fn new(path: &str) -> Self {
+    pub fn from_file(path: &str) -> Result<Self, String> {
         let mut data = vec![];
-        {
-            let mut file = File::open(path).expect("error in opening file");
-            file.read_to_end(&mut data)
-                .expect("error in reading contents of file");
-        }
-
+        let mut file = File::open(path).map_err(|e| format!("error in opening file: {}", e))?;
+        file.read_to_end(&mut data)
+            .map_err(|e| format!("error in reading file: {}", e))?;
+        Ok(Self::new(&data))
+    }
+    pub fn new(data: &[u8]) -> Self {
         let position = data
             .windows(METADATA_SECTION_START.len())
             .rev()
@@ -110,6 +150,24 @@ impl MaxmindDB {
         }
     }
 
+    fn write_over_node_bytes(n: &mut [u8], bit: u128, record_size: u16, val: u32) {
+        let val = val.to_be_bytes();
+
+        match record_size {
+            28 if bit == 0 => {
+                n[0..=2].copy_from_slice(&val[1..=3]);
+                n[3] = (n[3] & 0b0000_1111) | (val[0] << 4);
+            }
+            28 if bit == 1 => {
+                n[4..=6].copy_from_slice(&val[1..=3]);
+                n[3] = (n[3] & 0b1111_0000) | (val[0] & 0b0000_1111);
+            }
+            24 if bit == 0 => n[0..=2].copy_from_slice(&val[1..=3]),
+            24 if bit == 1 => n[3..=5].copy_from_slice(&val[1..=3]),
+            _ => unreachable!(),
+        }
+    }
+
     pub fn lookup(&self, addr: IpAddr) -> Option<Data> {
         let node_size = self.metadata.record_size as usize * 2 / 8;
         let mut node = 0;
@@ -139,15 +197,14 @@ impl MaxmindDB {
         }
     }
 
-    pub fn read_binary_tree(&self, node: u32, position: usize) {
+    pub fn consume_country_database(mut self, countries: &FxHashSet<String>) -> ProcessedDb {
         let mut stack = vec![];
         let node_size = self.metadata.record_size as usize * 2 / 8;
-
-        let mut count = 0;
-        stack.push((node, position));
+        stack.push((0, 0));
 
         while let Some((node, position)) = stack.pop() {
-            let n = &self.data[node as usize * node_size..(node as usize * node_size) + node_size];
+            let n =
+                &mut self.data[node as usize * node_size..(node as usize * node_size) + node_size];
             let node_1 = Self::node_from_bytes(n, 0, self.metadata.record_size);
             let node_2 = Self::node_from_bytes(n, 1, self.metadata.record_size);
 
@@ -158,26 +215,103 @@ impl MaxmindDB {
                 stack.push((node_2, position + 1));
             }
 
-            if node_1 > self.metadata.node_count {
-                let data_section_offset = node_1 - self.metadata.node_count;
+            let data_section_offset = if node_1 != BLOCK_MARKER && node_1 > self.metadata.node_count
+            {
+                node_1 - self.metadata.node_count
+            } else if node_2 != BLOCK_MARKER && node_2 > self.metadata.node_count {
+                node_2 - self.metadata.node_count
+            } else {
+                continue;
+            };
 
-                let data = self.read_data(
-                    self.metadata.data_section_start + data_section_offset as usize - 16,
+            let (data, _) = self
+                .read_data(self.metadata.data_section_start + data_section_offset as usize - 16);
+
+            let Data::Map(data) = data else {
+                unreachable!()
+            };
+            let Some(Data::Map(country)) = data.get("country".as_bytes()) else {
+                continue;
+            };
+            let Some(iso_code) = country.get("iso_code".as_bytes()) else {
+                unreachable!()
+            };
+
+            if countries.contains(&iso_code.to_string()) {
+                // Mark this node as non existent
+                Self::write_over_node_bytes(
+                    &mut self.data
+                        [node as usize * node_size..(node as usize * node_size) + node_size],
+                    0,
+                    self.metadata.record_size,
+                    BLOCK_MARKER,
                 );
-                count += 1;
-            }
-
-            if node_2 > self.metadata.node_count {
-                let data_section_offset = node_2 - self.metadata.node_count;
-                let data = self.read_data(
-                    self.metadata.data_section_start + data_section_offset as usize - 16,
-                );
-
-                count += 1;
             }
         }
 
-        println!("count = {}", count);
+        // Trim database to only contain the binary tree
+        ProcessedDb {
+            node_count: self.metadata.node_count,
+            record_size: self.metadata.record_size,
+            db: self.data[..self.metadata.data_section_start].to_vec(),
+        }
+    }
+
+    pub fn consume_asn_database(mut self, asns: &FxHashSet<u32>) -> ProcessedDb {
+        let mut stack = vec![];
+        let node_size = self.metadata.record_size as usize * 2 / 8;
+        stack.push((0, 0));
+
+        while let Some((node, position)) = stack.pop() {
+            let n =
+                &mut self.data[node as usize * node_size..(node as usize * node_size) + node_size];
+            let node_1 = Self::node_from_bytes(n, 0, self.metadata.record_size);
+            let node_2 = Self::node_from_bytes(n, 1, self.metadata.record_size);
+
+            if position < 128 && node_1 < self.metadata.node_count {
+                stack.push((node_1, position + 1));
+            }
+            if position < 128 && node_2 < self.metadata.node_count {
+                stack.push((node_2, position + 1));
+            }
+
+            let data_section_offset = if node_1 != BLOCK_MARKER && node_1 > self.metadata.node_count
+            {
+                node_1 - self.metadata.node_count
+            } else if node_2 != BLOCK_MARKER && node_2 > self.metadata.node_count {
+                node_2 - self.metadata.node_count
+            } else {
+                continue;
+            };
+
+            let (data, _) = self
+                .read_data(self.metadata.data_section_start + data_section_offset as usize - 16);
+
+            let Data::Map(data) = data else {
+                unreachable!()
+            };
+            let Some(Data::U32(asn)) = data.get("autonomous_system_number".as_bytes()) else {
+                continue;
+            };
+
+            if asns.contains(asn) {
+                // Mark this node as non existent
+                Self::write_over_node_bytes(
+                    &mut self.data
+                        [node as usize * node_size..(node as usize * node_size) + node_size],
+                    0,
+                    self.metadata.record_size,
+                    BLOCK_MARKER,
+                );
+            }
+        }
+
+        // Trim database to only contain the binary tree
+        ProcessedDb {
+            node_count: self.metadata.node_count,
+            record_size: self.metadata.record_size,
+            db: self.data[..self.metadata.data_section_start].to_vec(),
+        }
     }
 
     fn read_data(&self, read_offset: usize) -> (Data, usize) {

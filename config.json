@@ -1,0 +1,18 @@
+{
+  "db": {
+    "maxmind_key": "",
+    "//": "refresh every 24h",
+    "refresh_interval": 86400,
+    "path": "/tmp/geofw"
+  },
+  "interface": "enp6s18",
+  "source_countries": [
+    "CN",
+    "RU"
+  ],
+  "source_asn": [
+    14061,
+    136907,
+    55990
+  ]
+}

@@ -4,14 +4,12 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{Queue, RingBuf},
+    maps::{Array, HashMap},
     programs::XdpContext,
 };
-use aya_log_ebpf::info;
-use core::{
-    mem,
-    net::{Ipv4Addr, Ipv6Addr},
-};
+use aya_log_ebpf::{info, warn};
+use core::{mem, net::IpAddr, usize};
+use geofw_common::{ProgramParameters, BLOCK_MARKER};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{Ipv4Hdr, Ipv6Hdr},
@@ -39,10 +37,13 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Option<*const T> {
 }
 
 #[map]
-static REQUEST: RingBuf = RingBuf::with_byte_size(128, 0);
+static BLOCKED_ASN: Array<u8> = Array::with_max_entries(1024 * 1024 * 20, 0); // 10MiB
 
 #[map]
-static RESPONSE: Queue<bool> = Queue::with_max_entries(128, 0);
+static BLOCKED_COUNTRY: Array<u8> = Array::with_max_entries(1024 * 1024 * 50, 0);
+
+#[map]
+static PARAMETERS: HashMap<u8, u32> = HashMap::with_max_entries(1024, 0);
 
 fn try_geofw(ctx: XdpContext) -> Result<u32, u32> {
     let eth: *const EthHdr = ptr_at(&ctx, 0).ok_or(xdp_action::XDP_PASS)?;
@@ -59,27 +60,16 @@ fn filter_ip_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    if let Some(mut buf) = REQUEST.reserve::<Ipv4Addr>(0) {
-        buf.write(source);
-        buf.submit(0);
-    }
-
-    let mut result = false;
-    let mut n = 0;
-    while n < 10 {
-        if let Some(r) = RESPONSE.pop() {
-            result = r;
-            break;
-        }
-        n += 1;
-    }
+    let result = should_block(&ctx, "asn", &BLOCKED_ASN, IpAddr::V4(source))
+        || should_block(&ctx, "country", &BLOCKED_COUNTRY, IpAddr::V4(source));
 
     if result {
-        Ok(xdp_action::XDP_PASS)
-    } else {
         info!(&ctx, "ipv4 source = {} result = {}", source, result as u8);
 
         Ok(xdp_action::XDP_DROP)
+    } else {
+        //  info!(&ctx, "ipv6 source = {} result = {}", source, result as u8);
+        Ok(xdp_action::XDP_PASS)
     }
 }
 
@@ -87,28 +77,105 @@ fn filter_ipv6_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    // info!(&ctx, "ipv6 source = {}", source);
-    if let Some(mut buf) = REQUEST.reserve::<Ipv6Addr>(0) {
-        buf.write(source);
-        buf.submit(0);
-    }
-
-    let mut result = false;
-    let mut n = 0;
-    while n < 10 {
-        if let Some(r) = RESPONSE.pop() {
-            result = r;
-            break;
-        }
-        n += 1;
-    }
+    let result = should_block(&ctx, "asn", &BLOCKED_ASN, IpAddr::V6(source))
+        || should_block(&ctx, "country", &BLOCKED_COUNTRY, IpAddr::V6(source));
 
     if result {
-        Ok(xdp_action::XDP_PASS)
-    } else {
-        info!(&ctx, "ipv4 source = {} result = {}", source, result as u8);
+        info!(&ctx, "ipv6 source = {} result = {}", source, result as u8);
 
         Ok(xdp_action::XDP_DROP)
+    } else {
+        //   info!(&ctx, "ipv6 source = {} result = {}", source, result as u8);
+
+        Ok(xdp_action::XDP_PASS)
+    }
+}
+
+pub fn should_block(ctx: &XdpContext, map_name: &str, map: &Array<u8>, addr: IpAddr) -> bool {
+    let record_size = match map_name {
+        "country" => unsafe { PARAMETERS.get(&(ProgramParameters::CountryRecordSize as u8)) },
+        "asn" => unsafe { PARAMETERS.get(&(ProgramParameters::AsnRecordSize as u8)) },
+
+        _ => {
+            warn!(ctx, "unknown map: {}", map_name);
+            return false;
+        }
+    };
+    let Some(&record_size) = record_size else {
+        // warn!(ctx, "error in geting record size: {}", map_name);
+
+        return false;
+    };
+
+    let node_count = match map_name {
+        "country" => unsafe { PARAMETERS.get(&(ProgramParameters::CountryNodeCount as u8)) },
+        "asn" => unsafe { PARAMETERS.get(&(ProgramParameters::AsnNodeCount as u8)) },
+
+        _ => {
+            warn!(ctx, "unknown map: {}", map_name);
+
+            return false;
+        }
+    };
+    let Some(&node_count) = node_count else {
+        //  warn!(ctx, "error in getting node count: {}", map_name);
+
+        return false;
+    };
+
+    let node_size = record_size as usize * 2 / 8;
+    let mut node = 0;
+    let mut ip = match addr {
+        IpAddr::V4(a) => a.to_bits() as u128,
+        IpAddr::V6(a) => a.to_bits(),
+    };
+
+    let mut i = 0;
+    while i < 128 && node < node_count {
+        let bit = ip & (1 << 127);
+        ip <<= 1;
+
+        let mut slice = [0; 8];
+        for (i, v) in slice.iter_mut().enumerate().take(node_size) {
+            *v = match map.get(node * node_size as u32 + i as u32) {
+                Some(&v) => v,
+                None => {
+                    warn!(
+                        ctx,
+                        "error in getting item at position node * node + i as i32 = {} map = {}",
+                        node * node + i as u32,
+                        map_name
+                    );
+                    return false;
+                }
+            }
+        }
+        node = node_from_bytes(slice, if bit > 0 { 1 } else { 0 }, record_size as u16);
+        i += 1;
+    }
+
+    node == BLOCK_MARKER
+}
+
+fn node_from_bytes(n: [u8; 8], bit: u8, record_size: u16) -> u32 {
+    match record_size {
+        28 => {
+            if bit == 0 {
+                u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]])
+            } else {
+                u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]])
+            }
+        }
+        24 => {
+            if bit == 0 {
+                u32::from_be_bytes([0, n[0], n[1], n[2]])
+            } else {
+                u32::from_be_bytes([0, n[3], n[4], n[5]])
+            }
+        }
+
+        // this should never reach
+        _ => 0,
     }
 }
 
