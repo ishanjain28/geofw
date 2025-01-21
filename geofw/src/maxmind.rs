@@ -131,17 +131,17 @@ impl MaxmindDB {
         map
     }
 
-    fn node_from_bytes(n: &[u8], bit: u128, record_size: u16) -> u32 {
+    fn node_from_bytes(n: &[u8], bit: bool, record_size: u16) -> u32 {
         match record_size {
             28 => {
-                if bit == 0 {
+                if bit {
                     u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]])
                 } else {
                     u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]])
                 }
             }
             24 => {
-                if bit == 0 {
+                if bit {
                     u32::from_be_bytes([0, n[0], n[1], n[2]])
                 } else {
                     u32::from_be_bytes([0, n[3], n[4], n[5]])
@@ -173,19 +173,27 @@ impl MaxmindDB {
     pub fn lookup(&self, addr: IpAddr) -> Option<Data> {
         let node_size = self.metadata.record_size as usize * 2 / 8;
         let mut node = 0;
+        let mut i = 0i8;
+
         let mut ip = match addr {
-            IpAddr::V4(a) => a.to_bits() as u128,
-            IpAddr::V6(a) => a.to_bits(),
+            IpAddr::V4(a) => {
+                node = 96;
+                i = 31;
+                a.to_bits() as u128
+            }
+            IpAddr::V6(a) => {
+                node = 0;
+                i = 127;
+                a.to_bits()
+            }
         };
 
-        let mut i = 0;
-        while i < 128 && node < self.metadata.node_count {
-            let bit = ip & (1 << 127);
-            ip <<= 1;
+        while i >= 0 && node < self.metadata.node_count {
+            let bit = (ip & (1 << i)) == 0;
 
             let n = &self.data[node as usize * node_size..(node as usize * node_size) + node_size];
             node = Self::node_from_bytes(n, bit, self.metadata.record_size);
-            i += 1;
+            i -= 1;
         }
 
         if node == self.metadata.node_count {
@@ -207,8 +215,8 @@ impl MaxmindDB {
         while let Some((node, position)) = stack.pop() {
             let n =
                 &mut self.data[node as usize * node_size..(node as usize * node_size) + node_size];
-            let node_1 = Self::node_from_bytes(n, 0, self.metadata.record_size);
-            let node_2 = Self::node_from_bytes(n, 1, self.metadata.record_size);
+            let node_1 = Self::node_from_bytes(n, false, self.metadata.record_size);
+            let node_2 = Self::node_from_bytes(n, true, self.metadata.record_size);
 
             if position < 128 && node_1 < self.metadata.node_count {
                 stack.push((node_1, position + 1));

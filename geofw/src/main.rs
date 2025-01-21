@@ -132,8 +132,6 @@ fn fetch_geoip_db(config: &Config, db_name: MaxmindDb) -> Result<ProcessedDb, St
 
     let db = maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?;
 
-    info!("downloaded {}", db_name);
-
     match db_name {
         MaxmindDb::Country => Ok(db.consume(|data| -> bool {
             let Some(Data::Map(country)) = data.get("country".as_bytes()) else {

@@ -124,14 +124,18 @@ pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr:
 
     let node_size = record_size as usize * 2 / 8;
     let mut node = 0;
+    let mut i = 128;
     let mut ip = match addr {
-        IpAddr::V4(a) => a.to_bits() as u128,
+        IpAddr::V4(a) => {
+            i = 32;
+            node = 96;
+            (a.to_bits() as u128) << 96
+        }
         IpAddr::V6(a) => a.to_bits(),
     };
 
-    let mut i = 0;
-    while i < 128 && node < node_count {
-        let bit = ip & (1 << 127);
+    while i >= 0 && node < node_count {
+        let bit = (ip & (1 << 127)) == 0;
         ip <<= 1;
 
         let mut slice = [0; 8];
@@ -148,24 +152,24 @@ pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr:
                 }
             }
         }
-        node = node_from_bytes(slice, if bit > 0 { 1 } else { 0 }, record_size as u16);
-        i += 1;
+        node = node_from_bytes(slice, bit, record_size as u16);
+        i -= 1;
     }
 
     node == BLOCK_MARKER
 }
 
-fn node_from_bytes(n: [u8; 8], bit: u8, record_size: u16) -> u32 {
+fn node_from_bytes(n: [u8; 8], bit: bool, record_size: u16) -> u32 {
     match record_size {
         28 => {
-            if bit == 0 {
+            if bit {
                 u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]])
             } else {
                 u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]])
             }
         }
         24 => {
-            if bit == 0 {
+            if bit {
                 u32::from_be_bytes([0, n[0], n[1], n[2]])
             } else {
                 u32::from_be_bytes([0, n[3], n[4], n[5]])
