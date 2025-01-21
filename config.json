@@ -3,7 +3,7 @@
     "maxmind_key": "",
     "//": "refresh every 24h",
     "refresh_interval": 86400,
-    "path": "/tmp/geofw"
+    "path": "/home/ishan/geofw/geofw"
   },
   "interface": "enp6s18",
   "source_countries": [

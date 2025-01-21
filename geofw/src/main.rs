@@ -9,18 +9,18 @@ use aya::{
 use flate2::bufread::GzDecoder;
 use fxhash::FxHashSet;
 use geofw_common::ProgramParameters;
-use log::{debug, info, warn};
-use maxmind::ProcessedDb;
+use log::{debug, error, info, warn};
+use maxmind::{Data, ProcessedDb};
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{BufReader, ErrorKind, Read},
     path::PathBuf,
 };
 use tar::Archive;
 use tokio::{signal, time};
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub db: Db,
     pub interface: String,
@@ -28,22 +28,52 @@ pub struct Config {
     pub source_asn: FxHashSet<u32>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            db: Default::default(),
+            interface: "enp1s0".to_string(),
+            source_countries: Default::default(),
+            source_asn: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Db {
     pub maxmind_key: String,
     pub refresh_interval: i64,
     pub path: String,
 }
 
+impl Default for Db {
+    fn default() -> Self {
+        Self {
+            maxmind_key: "".to_string(),
+            refresh_interval: 86400,
+            path: "/tmp/geofw".to_string(),
+        }
+    }
+}
+
 const COUNTRY_DB: &str = "GeoLite2-Country";
 const ASN_DB: &str = "GeoLite2-ASN";
 
 fn read_config(path: &str) -> Result<Config, String> {
-    let mut f = File::open(path).map_err(|e| e.to_string())?;
-    let mut contents = vec![];
-    f.read_to_end(&mut contents).map_err(|e| e.to_string())?;
-
-    serde_json::from_slice(&contents).map_err(|e| e.to_string())
+    match File::open(path) {
+        Ok(mut f) => {
+            let mut contents = vec![];
+            f.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+            serde_json::from_slice(&contents).map_err(|e| e.to_string())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if let Err(e) = File::create(path) {
+                warn!("error in writing config to {}: {}", path, e);
+            }
+            Ok(Default::default())
+        }
+        Err(e) => Err(format!("permission denied reading {}: {}", path, e)),
+    }
 }
 
 fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String> {
@@ -51,19 +81,15 @@ fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String>
     unpack_path.push(&config.db.path);
     unpack_path.push(format!("{}.mmdb", db_name));
 
-    info!("unpack path = {:?}", unpack_path);
-
     let url = format!("https://download.maxmind.com/app/geoip_download?edition_id={}&license_key={}&suffix=tar.gz", db_name, config.db.maxmind_key);
 
-    info!("fetching db from = {}", url);
+    info!("path = {:?} fetching db from = {}", unpack_path, url);
 
     let response = ureq::get(&url).call();
 
-    let db = match response {
+    match response {
         Ok(v) if v.status() != 200 => {
             warn!("response from maxmind is not 200 = {}", v.status());
-
-            maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?
         }
         Ok(resp) => {
             let reader = resp.into_reader();
@@ -74,40 +100,53 @@ fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String>
                 .entries()
                 .map_err(|e| format!("error in listing files in the archive: {}", e))?;
 
-            let mut db_entry = entries
+            let db_entry = entries
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter_map(|entry| {
-                    let path = match entry.path() {
-                        Ok(v) => v,
-                        Err(_) => return None,
+                    let Ok(path) = entry.path() else {
+                        return None;
                     };
-
                     if path.extension().is_none_or(|x| x != "mmdb") {
                         return None;
                     }
                     Some(entry)
                 })
-                .next()
-                .unwrap();
+                .next();
+
+            let Some(mut db_entry) = db_entry else {
+                return Err("error in finding mmdb file in the tarball".to_string());
+            };
 
             db_entry.unpack(&unpack_path).map_err(|e| e.to_string())?;
-
-            maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?
         }
-
         Err(e) => {
             warn!("error in fetching db from maxmind: {}", e);
-
-            maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?
         }
     };
+
+    let db = maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?;
 
     info!("downloaded {}", db_name);
 
     match db_name {
-        COUNTRY_DB => Ok(db.consume_country_database(&config.source_countries)),
-        ASN_DB => Ok(db.consume_asn_database(&config.source_asn)),
+        COUNTRY_DB => Ok(db.consume(|data| -> bool {
+            let Some(Data::Map(country)) = data.get("country".as_bytes()) else {
+                return false;
+            };
+            let Some(iso_code) = country.get("iso_code".as_bytes()) else {
+                return false;
+            };
+
+            config.source_countries.contains(&iso_code.to_string())
+        })),
+        ASN_DB => Ok(db.consume(|data| -> bool {
+            let Some(Data::U32(asn)) = data.get("autonomous_system_number".as_bytes()) else {
+                return false;
+            };
+
+            config.source_asn.contains(asn)
+        })),
 
         _ => Err("unknown db".to_string()),
     }
