@@ -7,9 +7,9 @@ use aya_ebpf::{
     maps::{Array, HashMap},
     programs::XdpContext,
 };
-use aya_log_ebpf::{info, warn};
-use core::{mem, net::IpAddr, usize};
-use geofw_common::{ProgramParameters, BLOCK_MARKER};
+use aya_log_ebpf::{debug, warn};
+use core::{mem, net::IpAddr};
+use geofw_common::{MaxmindDb, ProgramParameters, BLOCK_MARKER};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{Ipv4Hdr, Ipv6Hdr},
@@ -60,11 +60,16 @@ fn filter_ip_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    let result = should_block(&ctx, "asn", &BLOCKED_ASN, IpAddr::V4(source))
-        || should_block(&ctx, "country", &BLOCKED_COUNTRY, IpAddr::V4(source));
+    let result = should_block(&ctx, MaxmindDb::Asn, &BLOCKED_ASN, IpAddr::V4(source))
+        || should_block(
+            &ctx,
+            MaxmindDb::Country,
+            &BLOCKED_COUNTRY,
+            IpAddr::V4(source),
+        );
 
     if result {
-        info!(&ctx, "ipv4 source = {} result = {}", source, result as u8);
+        debug!(&ctx, "ipv4 source = {} blocked = {}", source, result as u8);
 
         Ok(xdp_action::XDP_DROP)
     } else {
@@ -77,11 +82,16 @@ fn filter_ipv6_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    let result = should_block(&ctx, "asn", &BLOCKED_ASN, IpAddr::V6(source))
-        || should_block(&ctx, "country", &BLOCKED_COUNTRY, IpAddr::V6(source));
+    let result = should_block(&ctx, MaxmindDb::Asn, &BLOCKED_ASN, IpAddr::V6(source))
+        || should_block(
+            &ctx,
+            MaxmindDb::Country,
+            &BLOCKED_COUNTRY,
+            IpAddr::V6(source),
+        );
 
     if result {
-        info!(&ctx, "ipv6 source = {} result = {}", source, result as u8);
+        debug!(&ctx, "ipv6 source = {} blocked = {}", source, result as u8);
 
         Ok(xdp_action::XDP_DROP)
     } else {
@@ -91,35 +101,24 @@ fn filter_ipv6_packet(ctx: XdpContext) -> Result<u32, u32> {
     }
 }
 
-pub fn should_block(ctx: &XdpContext, map_name: &str, map: &Array<u8>, addr: IpAddr) -> bool {
-    let record_size = match map_name {
-        "country" => unsafe { PARAMETERS.get(&(ProgramParameters::CountryRecordSize as u8)) },
-        "asn" => unsafe { PARAMETERS.get(&(ProgramParameters::AsnRecordSize as u8)) },
-
-        _ => {
-            warn!(ctx, "unknown map: {}", map_name);
-            return false;
-        }
+pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr: IpAddr) -> bool {
+    let record_size = match db_name {
+        MaxmindDb::Country => unsafe {
+            PARAMETERS.get(&(ProgramParameters::CountryRecordSize as u8))
+        },
+        MaxmindDb::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnRecordSize as u8)) },
     };
     let Some(&record_size) = record_size else {
-        // warn!(ctx, "error in geting record size: {}", map_name);
-
         return false;
     };
 
-    let node_count = match map_name {
-        "country" => unsafe { PARAMETERS.get(&(ProgramParameters::CountryNodeCount as u8)) },
-        "asn" => unsafe { PARAMETERS.get(&(ProgramParameters::AsnNodeCount as u8)) },
-
-        _ => {
-            warn!(ctx, "unknown map: {}", map_name);
-
-            return false;
-        }
+    let node_count = match db_name {
+        MaxmindDb::Country => unsafe {
+            PARAMETERS.get(&(ProgramParameters::CountryNodeCount as u8))
+        },
+        MaxmindDb::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnNodeCount as u8)) },
     };
     let Some(&node_count) = node_count else {
-        //  warn!(ctx, "error in getting node count: {}", map_name);
-
         return false;
     };
 
@@ -142,9 +141,8 @@ pub fn should_block(ctx: &XdpContext, map_name: &str, map: &Array<u8>, addr: IpA
                 None => {
                     warn!(
                         ctx,
-                        "error in getting item at position node * node + i as i32 = {} map = {}",
-                        node * node + i as u32,
-                        map_name
+                        "error in reading position = {}",
+                        node * node_size as u32 + i as u32,
                     );
                     return false;
                 }

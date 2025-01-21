@@ -8,8 +8,8 @@ use aya::{
 };
 use flate2::bufread::GzDecoder;
 use fxhash::FxHashSet;
-use geofw_common::ProgramParameters;
-use log::{debug, error, info, warn};
+use geofw_common::{MaxmindDb, ProgramParameters};
+use log::{debug, info, warn};
 use maxmind::{Data, ProcessedDb};
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -56,9 +56,6 @@ impl Default for Db {
     }
 }
 
-const COUNTRY_DB: &str = "GeoLite2-Country";
-const ASN_DB: &str = "GeoLite2-ASN";
-
 fn read_config(path: &str) -> Result<Config, String> {
     match File::open(path) {
         Ok(mut f) => {
@@ -84,7 +81,7 @@ fn read_config(path: &str) -> Result<Config, String> {
     }
 }
 
-fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String> {
+fn fetch_geoip_db(config: &Config, db_name: MaxmindDb) -> Result<ProcessedDb, String> {
     let mut unpack_path = PathBuf::new();
     unpack_path.push(&config.db.path);
     unpack_path.push(format!("{}.mmdb", db_name));
@@ -138,7 +135,7 @@ fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String>
     info!("downloaded {}", db_name);
 
     match db_name {
-        COUNTRY_DB => Ok(db.consume(|data| -> bool {
+        MaxmindDb::Country => Ok(db.consume(|data| -> bool {
             let Some(Data::Map(country)) = data.get("country".as_bytes()) else {
                 return false;
             };
@@ -148,15 +145,13 @@ fn fetch_geoip_db(config: &Config, db_name: &str) -> Result<ProcessedDb, String>
 
             config.source_countries.contains(&iso_code.to_string())
         })),
-        ASN_DB => Ok(db.consume(|data| -> bool {
+        MaxmindDb::Asn => Ok(db.consume(|data| -> bool {
             let Some(Data::U32(asn)) = data.get("autonomous_system_number".as_bytes()) else {
                 return false;
             };
 
             config.source_asn.contains(asn)
         })),
-
-        _ => Err("unknown db".to_string()),
     }
 }
 
@@ -201,17 +196,17 @@ async fn main() -> anyhow::Result<()> {
             _ = interval.tick() => {
                 info!("updating DB");
 
-                match update_geoip_map(&config, &mut ebpf, COUNTRY_DB, "BLOCKED_COUNTRY") {
+                match update_geoip_map(&config, &mut ebpf, MaxmindDb::Country, "BLOCKED_COUNTRY") {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("error in updating map {} = {}", COUNTRY_DB, e);
+                        warn!("error in updating map {} = {}", MaxmindDb::Country, e);
                     }
                 }
 
-                match update_geoip_map(&config, &mut ebpf, ASN_DB, "BLOCKED_ASN") {
+                match update_geoip_map(&config, &mut ebpf, MaxmindDb::Asn, "BLOCKED_ASN") {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("error in updating map {} = {}", ASN_DB, e);
+                        warn!("error in updating map {} = {}", MaxmindDb::Asn, e);
                     }
                 }
             }
@@ -224,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 fn update_geoip_map(
     config: &Config,
     ebpf: &mut Ebpf,
-    db_name: &str,
+    db_name: MaxmindDb,
     map_name: &str,
 ) -> Result<(), String> {
     info!("updating maps db_name = {db_name} map_name = {map_name}");
@@ -252,7 +247,7 @@ fn update_geoip_map(
     .expect("error in processing parameter map");
 
     match db_name {
-        COUNTRY_DB => {
+        MaxmindDb::Country => {
             map.insert(
                 ProgramParameters::CountryNodeCount as u8,
                 result.node_count,
@@ -266,7 +261,7 @@ fn update_geoip_map(
             )
             .expect("error in writing country record size to map");
         }
-        ASN_DB => {
+        MaxmindDb::Asn => {
             map.insert(ProgramParameters::AsnNodeCount as u8, result.node_count, 0)
                 .expect("error in writing country node count to map");
             map.insert(
@@ -276,8 +271,6 @@ fn update_geoip_map(
             )
             .expect("error in writing country record size to map");
         }
-
-        _ => unreachable!(),
     }
 
     Ok(())

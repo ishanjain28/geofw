@@ -1,4 +1,5 @@
-use fxhash::{FxHashMap, FxHashSet};
+use core::str;
+use fxhash::FxHashMap;
 use geofw_common::BLOCK_MARKER;
 use std::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
@@ -50,7 +51,7 @@ pub struct ProcessedDb {
 impl Display for Data<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Data::String(s) => f.write_str(&String::from_utf8_lossy(s)),
+            Data::String(s) => write!(f, "{}", unsafe { str::from_utf8_unchecked(s) }),
             Data::Double(s) => write!(f, "{s}"),
             Data::Bytes(s) => write!(f, "{s:?}"),
             Data::U16(s) => write!(f, "{s}"),
