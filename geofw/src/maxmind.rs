@@ -52,9 +52,9 @@ impl Display for Data<'_> {
         match self {
             Data::String(s) => f.write_str(&String::from_utf8_lossy(s)),
             Data::Double(s) => write!(f, "{s}"),
-            Data::Bytes(s) => f.write_fmt(format_args!("{:?}", s)),
-            Data::U16(s) => f.write_str(&s.to_string()),
-            Data::U32(s) => f.write_str(&s.to_string()),
+            Data::Bytes(s) => write!(f, "{s:?}"),
+            Data::U16(s) => write!(f, "{s}"),
+            Data::U32(s) => write!(f, "{s}"),
             Data::Map(hash_map) => {
                 for (k, v) in hash_map {
                     f.write_fmt(format_args!("{} => {}\n", String::from_utf8_lossy(k), v))
@@ -62,9 +62,9 @@ impl Display for Data<'_> {
                 }
                 Ok(())
             }
-            Data::I32(s) => f.write_str(&s.to_string()),
-            Data::U64(s) => f.write_str(&s.to_string()),
-            Data::U128(s) => f.write_str(&s.to_string()),
+            Data::I32(s) => write!(f, "{s}"),
+            Data::U64(s) => write!(f, "{s}"),
+            Data::U128(s) => write!(f, "{s}"),
             Data::Array(vec) => {
                 for (i, v) in vec.iter().enumerate() {
                     f.write_fmt(format_args!("index = {} value = {}\n", i, v))
@@ -73,9 +73,9 @@ impl Display for Data<'_> {
                 Ok(())
             }
             Data::DataCache => todo!(),
-            Data::End => f.write_str("END"),
-            Data::Boolean(s) => f.write_str(&s.to_string()),
-            Data::Float(s) => f.write_str(&s.to_string()),
+            Data::End => write!(f, "END"),
+            Data::Boolean(s) => write!(f, "{s}"),
+            Data::Float(s) => write!(f, "{s}"),
         }
     }
 }
@@ -287,11 +287,8 @@ impl MaxmindDB {
         }
     }
 
-    fn read_map(&self, offset: usize, read: usize, length: usize) -> (Data, usize) {
+    fn read_map(&self, offset: usize, mut read: usize, mut length: usize) -> (Data, usize) {
         let mut map = FxHashMap::with_capacity_and_hasher(length, Default::default());
-        // length is number of elements
-        let mut length = length;
-        let mut read = read;
 
         while length > 0 {
             let (key, r) = self.read_data(offset + read);
