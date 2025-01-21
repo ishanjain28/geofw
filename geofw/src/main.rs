@@ -14,7 +14,7 @@ use maxmind::{Data, ProcessedDb};
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::{BufReader, ErrorKind, Read},
+    io::{BufReader, ErrorKind, Read, Write},
     path::PathBuf,
 };
 use tar::Archive;
@@ -67,10 +67,18 @@ fn read_config(path: &str) -> Result<Config, String> {
             serde_json::from_slice(&contents).map_err(|e| e.to_string())
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            if let Err(e) = File::create(path) {
-                warn!("error in writing config to {}: {}", path, e);
+            let def: Config = Default::default();
+            match File::create(path) {
+                Ok(mut f) => {
+                    let json = serde_json::to_string_pretty(&def)
+                        .expect("error in marshalling config to json");
+                    if let Err(e) = f.write_all(json.as_bytes()) {
+                        warn!("error in writing default config to disk: {}", e);
+                    }
+                }
+                Err(e) => warn!("error in writing config to {}: {}", path, e),
             }
-            Ok(Default::default())
+            Ok(def)
         }
         Err(e) => Err(format!("permission denied reading {}: {}", path, e)),
     }
