@@ -238,7 +238,7 @@ fn update_geoip_map(
         map_name,
         result.record_size,
         result.node_count,
-        result.record_size as u64 * result.node_count as u64,
+        ((result.record_size as u32 * 2) / 8) * result.node_count,
         t.elapsed()
     );
 
