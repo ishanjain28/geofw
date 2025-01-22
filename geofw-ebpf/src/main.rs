@@ -9,7 +9,7 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::{debug, warn};
 use core::{mem, net::IpAddr};
-use geofw_common::{MaxmindDb, ProgramParameters, BLOCK_MARKER};
+use geofw_common::{MaxmindDbType, ProgramParameters, BLOCK_MARKER};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{Ipv4Hdr, Ipv6Hdr},
@@ -60,10 +60,10 @@ fn filter_ip_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    let result = should_block(&ctx, MaxmindDb::Asn, &BLOCKED_ASN, IpAddr::V4(source))
+    let result = should_block(&ctx, MaxmindDbType::Asn, &BLOCKED_ASN, IpAddr::V4(source))
         || should_block(
             &ctx,
-            MaxmindDb::Country,
+            MaxmindDbType::Country,
             &BLOCKED_COUNTRY,
             IpAddr::V4(source),
         );
@@ -82,10 +82,10 @@ fn filter_ipv6_packet(ctx: XdpContext) -> Result<u32, u32> {
     let ip: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN).ok_or(xdp_action::XDP_PASS)?;
     let source = unsafe { (*ip).src_addr() };
 
-    let result = should_block(&ctx, MaxmindDb::Asn, &BLOCKED_ASN, IpAddr::V6(source))
+    let result = should_block(&ctx, MaxmindDbType::Asn, &BLOCKED_ASN, IpAddr::V6(source))
         || should_block(
             &ctx,
-            MaxmindDb::Country,
+            MaxmindDbType::Country,
             &BLOCKED_COUNTRY,
             IpAddr::V6(source),
         );
@@ -101,22 +101,27 @@ fn filter_ipv6_packet(ctx: XdpContext) -> Result<u32, u32> {
     }
 }
 
-pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr: IpAddr) -> bool {
-    let record_size = match db_name {
-        MaxmindDb::Country => unsafe {
+pub fn should_block(
+    ctx: &XdpContext,
+    db_type: MaxmindDbType,
+    map: &Array<u8>,
+    addr: IpAddr,
+) -> bool {
+    let record_size = match db_type {
+        MaxmindDbType::Country => unsafe {
             PARAMETERS.get(&(ProgramParameters::CountryRecordSize as u8))
         },
-        MaxmindDb::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnRecordSize as u8)) },
+        MaxmindDbType::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnRecordSize as u8)) },
     };
     let Some(&record_size) = record_size else {
         return false;
     };
 
-    let node_count = match db_name {
-        MaxmindDb::Country => unsafe {
+    let node_count = match db_type {
+        MaxmindDbType::Country => unsafe {
             PARAMETERS.get(&(ProgramParameters::CountryNodeCount as u8))
         },
-        MaxmindDb::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnNodeCount as u8)) },
+        MaxmindDbType::Asn => unsafe { PARAMETERS.get(&(ProgramParameters::AsnNodeCount as u8)) },
     };
     let Some(&node_count) = node_count else {
         return false;
@@ -135,7 +140,7 @@ pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr:
     };
 
     while i >= 0 && node < node_count {
-        let bit = (ip & (1 << 127)) == 0;
+        let left = (ip & (1 << 127)) == 0;
         ip <<= 1;
 
         let mut slice = [0; 8];
@@ -152,31 +157,21 @@ pub fn should_block(ctx: &XdpContext, db_name: MaxmindDb, map: &Array<u8>, addr:
                 }
             }
         }
-        node = node_from_bytes(slice, bit, record_size as u16);
+        node = node_from_bytes(slice, left, record_size as u16);
         i -= 1;
     }
 
     node == BLOCK_MARKER
 }
 
-fn node_from_bytes(n: [u8; 8], bit: bool, record_size: u16) -> u32 {
+fn node_from_bytes(n: [u8; 8], left: bool, record_size: u16) -> u32 {
     match record_size {
-        28 => {
-            if bit {
-                u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]])
-            } else {
-                u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]])
-            }
-        }
-        24 => {
-            if bit {
-                u32::from_be_bytes([0, n[0], n[1], n[2]])
-            } else {
-                u32::from_be_bytes([0, n[3], n[4], n[5]])
-            }
-        }
+        28 if left => u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]]),
+        28 => u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]]),
+        24 if left => u32::from_be_bytes([0, n[0], n[1], n[2]]),
+        24 => u32::from_be_bytes([0, n[3], n[4], n[5]]),
 
-        // this should never reach
+        // This should never run unless we are using 32bit dbs
         _ => 0,
     }
 }

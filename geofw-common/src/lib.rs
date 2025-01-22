@@ -17,20 +17,20 @@ pub enum ProgramParameters {
 pub const BLOCK_MARKER: u32 = 0x00ffffff;
 
 #[derive(Copy, Clone)]
-pub enum MaxmindDb {
+pub enum MaxmindDbType {
     Country,
     Asn,
 }
 
-impl Display for MaxmindDb {
+impl Display for MaxmindDbType {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let val = match self {
-            MaxmindDb::Country => "GeoLite2-Country",
-            MaxmindDb::Asn => "GeoLite2-ASN",
+            MaxmindDbType::Country => "GeoLite2-Country",
+            MaxmindDbType::Asn => "GeoLite2-ASN",
         };
 
         write!(f, "{val}")
     }
 }
 
-// impl aya_log_ebpf::macro_support::Formatter for MaxmindDb {}
+

@@ -2,6 +2,7 @@ use core::str;
 use fxhash::FxHashMap;
 use geofw_common::BLOCK_MARKER;
 use std::{
+    collections::VecDeque,
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     fs::File,
     io::Read,
@@ -12,7 +13,7 @@ const METADATA_SECTION_START: &[u8] = &[
     0xab, 0xcd, 0xef, 0x4d, 0x61, 0x78, 0x4d, 0x69, 0x6e, 0x64, 0x2e, 0x63, 0x6f, 0x6d,
 ];
 
-pub struct MaxmindDB {
+pub struct MaxmindDb {
     pub metadata: Metadata,
     pub data: Vec<u8>,
 }
@@ -81,13 +82,13 @@ impl Display for Data<'_> {
     }
 }
 
-impl Debug for MaxmindDB {
+impl Debug for MaxmindDb {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         f.write_fmt(format_args!("{:?}", self.metadata))
     }
 }
 
-impl MaxmindDB {
+impl MaxmindDb {
     pub fn from_file(path: &str) -> Result<Self, String> {
         let mut data = vec![];
         let mut file = File::open(path).map_err(|e| format!("error in opening file: {}", e))?;
@@ -131,40 +132,30 @@ impl MaxmindDB {
         map
     }
 
-    fn node_from_bytes(n: &[u8], bit: bool, record_size: u16) -> u32 {
+    fn node_from_bytes(n: &[u8], left: bool, record_size: u16) -> u32 {
         match record_size {
-            28 => {
-                if bit {
-                    u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]])
-                } else {
-                    u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]])
-                }
-            }
-            24 => {
-                if bit {
-                    u32::from_be_bytes([0, n[0], n[1], n[2]])
-                } else {
-                    u32::from_be_bytes([0, n[3], n[4], n[5]])
-                }
-            }
+            28 if left => u32::from_be_bytes([(n[3] & 0b1111_0000) >> 4, n[0], n[1], n[2]]),
+            28 => u32::from_be_bytes([n[3] & 0b0000_1111, n[4], n[5], n[6]]),
+            24 if left => u32::from_be_bytes([0, n[0], n[1], n[2]]),
+            24 => u32::from_be_bytes([0, n[3], n[4], n[5]]),
             _ => unreachable!(),
         }
     }
 
-    fn write_over_node_bytes(n: &mut [u8], bit: u128, record_size: u16, val: u32) {
+    fn write_over_node_bytes(n: &mut [u8], left: bool, record_size: u16, val: u32) {
         let val = val.to_be_bytes();
 
         match record_size {
-            28 if bit == 0 => {
+            28 if left => {
                 n[0..=2].copy_from_slice(&val[1..=3]);
                 n[3] = (n[3] & 0b0000_1111) | (val[0] << 4);
             }
-            28 if bit == 1 => {
+            28 => {
                 n[4..=6].copy_from_slice(&val[1..=3]);
                 n[3] = (n[3] & 0b1111_0000) | (val[0] & 0b0000_1111);
             }
-            24 if bit == 0 => n[0..=2].copy_from_slice(&val[1..=3]),
-            24 if bit == 1 => n[3..=5].copy_from_slice(&val[1..=3]),
+            24 if left => n[0..=2].copy_from_slice(&val[1..=3]),
+            24 => n[3..=5].copy_from_slice(&val[1..=3]),
             _ => unreachable!(),
         }
     }
@@ -189,10 +180,10 @@ impl MaxmindDB {
         };
 
         while i >= 0 && node < self.metadata.node_count {
-            let bit = (ip & (1 << i)) == 0;
+            let left = (ip & (1 << i)) == 0;
 
             let n = &self.data[node as usize * node_size..(node as usize * node_size) + node_size];
-            node = Self::node_from_bytes(n, bit, self.metadata.record_size);
+            node = Self::node_from_bytes(n, left, self.metadata.record_size);
             i -= 1;
         }
 
@@ -207,50 +198,50 @@ impl MaxmindDB {
         }
     }
 
-    pub fn consume(mut self, should_block: impl Fn(FxHashMap<&[u8], Data>) -> bool) -> ProcessedDb {
-        let mut stack = vec![];
+    pub fn consume(
+        mut self,
+        should_block: impl Fn(&FxHashMap<&[u8], Data>) -> bool,
+    ) -> ProcessedDb {
+        let mut stack = VecDeque::new();
         let node_size = self.metadata.record_size as usize * 2 / 8;
-        stack.push((0, 0));
+        stack.push_back((0, 0, false));
 
-        while let Some((node, position)) = stack.pop() {
+        while let Some((node, parent, bit)) = stack.pop_front() {
+            if node == BLOCK_MARKER {
+                continue;
+            }
+            if node >= self.metadata.node_count {
+                let ds_offset = node - self.metadata.node_count;
+
+                let (data, _) =
+                    self.read_data(self.metadata.data_section_start + ds_offset as usize - 16);
+
+                let Data::Map(data) = data else {
+                    unreachable!()
+                };
+                if should_block(&data) {
+                    // Mark the parent of this node as non existent
+                    let node = parent;
+
+                    Self::write_over_node_bytes(
+                        &mut self.data
+                            [node as usize * node_size..(node as usize * node_size) + node_size],
+                        bit,
+                        self.metadata.record_size,
+                        BLOCK_MARKER,
+                    );
+                }
+
+                continue;
+            }
+
             let n =
                 &mut self.data[node as usize * node_size..(node as usize * node_size) + node_size];
             let node_1 = Self::node_from_bytes(n, false, self.metadata.record_size);
             let node_2 = Self::node_from_bytes(n, true, self.metadata.record_size);
 
-            if position < 128 && node_1 < self.metadata.node_count {
-                stack.push((node_1, position + 1));
-            }
-            if position < 128 && node_2 < self.metadata.node_count {
-                stack.push((node_2, position + 1));
-            }
-
-            let data_section_offset = if node_1 != BLOCK_MARKER && node_1 > self.metadata.node_count
-            {
-                node_1 - self.metadata.node_count
-            } else if node_2 != BLOCK_MARKER && node_2 > self.metadata.node_count {
-                node_2 - self.metadata.node_count
-            } else {
-                continue;
-            };
-
-            let (data, _) = self
-                .read_data(self.metadata.data_section_start + data_section_offset as usize - 16);
-
-            let Data::Map(data) = data else {
-                unreachable!()
-            };
-
-            if should_block(data) {
-                // Mark this node as non existent
-                Self::write_over_node_bytes(
-                    &mut self.data
-                        [node as usize * node_size..(node as usize * node_size) + node_size],
-                    0,
-                    self.metadata.record_size,
-                    BLOCK_MARKER,
-                );
-            }
+            stack.push_back((node_1, node, false));
+            stack.push_back((node_2, node, true));
         }
 
         // Trim database to only contain the binary tree
@@ -441,5 +432,29 @@ impl MaxmindDB {
         };
 
         (data_type, length, read + r)
+    }
+}
+
+impl ProcessedDb {
+    pub fn lookup(&self, addr: IpAddr) -> bool {
+        let node_size = self.record_size as usize * 2 / 8;
+        let mut node = 0;
+
+        let mut ip = match addr {
+            IpAddr::V4(a) => a.to_bits() as u128,
+            IpAddr::V6(a) => a.to_bits(),
+        };
+
+        let mut i = 0;
+        while i < 128 && node < self.node_count {
+            let left = (ip & (1 << 127)) == 0;
+            ip <<= 1;
+
+            let n = &self.db[node as usize * node_size..(node as usize * node_size) + node_size];
+            node = MaxmindDb::node_from_bytes(n, left, self.record_size);
+            i += 1;
+        }
+
+        node == BLOCK_MARKER
     }
 }

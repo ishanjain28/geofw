@@ -8,7 +8,7 @@ use aya::{
 };
 use flate2::bufread::GzDecoder;
 use fxhash::FxHashSet;
-use geofw_common::{MaxmindDb, ProgramParameters};
+use geofw_common::{MaxmindDbType, ProgramParameters};
 use log::{debug, info, warn};
 use maxmind::{Data, ProcessedDb};
 use serde_derive::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use std::{
     fs::File,
     io::{BufReader, ErrorKind, Read, Write},
     path::PathBuf,
+    time::Instant,
 };
 use tar::Archive;
 use tokio::{signal, time};
@@ -81,12 +82,12 @@ fn read_config(path: &str) -> Result<Config, String> {
     }
 }
 
-fn fetch_geoip_db(config: &Config, db_name: MaxmindDb) -> Result<ProcessedDb, String> {
+fn fetch_geoip_db(config: &Config, db_type: MaxmindDbType) -> Result<ProcessedDb, String> {
     let mut unpack_path = PathBuf::new();
     unpack_path.push(&config.db.path);
-    unpack_path.push(format!("{}.mmdb", db_name));
+    unpack_path.push(format!("{}.mmdb", db_type));
 
-    let url = format!("https://download.maxmind.com/app/geoip_download?edition_id={}&license_key={}&suffix=tar.gz", db_name, config.db.maxmind_key);
+    let url = format!("https://download.maxmind.com/app/geoip_download?edition_id={}&license_key={}&suffix=tar.gz", db_type, config.db.maxmind_key);
 
     info!("path = {:?} fetching db from = {}", unpack_path, url);
 
@@ -130,10 +131,10 @@ fn fetch_geoip_db(config: &Config, db_name: MaxmindDb) -> Result<ProcessedDb, St
         }
     };
 
-    let db = maxmind::MaxmindDB::from_file(&unpack_path.to_string_lossy())?;
+    let db = maxmind::MaxmindDb::from_file(&unpack_path.to_string_lossy())?;
 
-    match db_name {
-        MaxmindDb::Country => Ok(db.consume(|data| -> bool {
+    match db_type {
+        MaxmindDbType::Country => Ok(db.consume(|data| -> bool {
             let Some(Data::Map(country)) = data.get("country".as_bytes()) else {
                 return false;
             };
@@ -143,7 +144,7 @@ fn fetch_geoip_db(config: &Config, db_name: MaxmindDb) -> Result<ProcessedDb, St
 
             config.source_countries.contains(&iso_code.to_string())
         })),
-        MaxmindDb::Asn => Ok(db.consume(|data| -> bool {
+        MaxmindDbType::Asn => Ok(db.consume(|data| -> bool {
             let Some(Data::U32(asn)) = data.get("autonomous_system_number".as_bytes()) else {
                 return false;
             };
@@ -194,17 +195,17 @@ async fn main() -> anyhow::Result<()> {
             _ = interval.tick() => {
                 info!("updating DB");
 
-                match update_geoip_map(&config, &mut ebpf, MaxmindDb::Country, "BLOCKED_COUNTRY") {
+                match update_geoip_map(&config, &mut ebpf, MaxmindDbType::Country, "BLOCKED_COUNTRY") {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("error in updating map {} = {}", MaxmindDb::Country, e);
+                        warn!("error in updating map {} = {}", MaxmindDbType::Country, e);
                     }
                 }
 
-                match update_geoip_map(&config, &mut ebpf, MaxmindDb::Asn, "BLOCKED_ASN") {
+                match update_geoip_map(&config, &mut ebpf, MaxmindDbType::Asn, "BLOCKED_ASN") {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("error in updating map {} = {}", MaxmindDb::Asn, e);
+                        warn!("error in updating map {} = {}", MaxmindDbType::Asn, e);
                     }
                 }
             }
@@ -217,26 +218,29 @@ async fn main() -> anyhow::Result<()> {
 fn update_geoip_map(
     config: &Config,
     ebpf: &mut Ebpf,
-    db_name: MaxmindDb,
+    db_type: MaxmindDbType,
     map_name: &str,
 ) -> Result<(), String> {
-    info!("updating maps db_name = {db_name} map_name = {map_name}");
+    info!("updating maps db_type = {db_type} map_name = {map_name}");
 
     let mut map = Array::try_from(ebpf.map_mut(map_name).expect("error in getting map"))
         .expect("error in processing map");
 
-    let result = fetch_geoip_db(config, db_name)?;
+    let result = fetch_geoip_db(config, db_type)?;
 
-    info!(
-        "set map = {map_name} up to the location = {} record_size = {} node_count = {}",
-        result.db.len(),
-        result.record_size,
-        result.node_count
-    );
-
+    let t = Instant::now();
     for (i, v) in result.db.into_iter().enumerate() {
         map.set(i as u32, v, 0).map_err(|e| e.to_string())?;
     }
+
+    info!(
+        "updated map = {} record_size = {} node_count = {} est_size = {} time_taken = {:?}",
+        map_name,
+        result.record_size,
+        result.node_count,
+        result.record_size as u64 * result.node_count as u64,
+        t.elapsed()
+    );
 
     let mut map: HashMap<&mut MapData, u8, u32> = HashMap::try_from(
         ebpf.map_mut("PARAMETERS")
@@ -244,8 +248,8 @@ fn update_geoip_map(
     )
     .expect("error in processing parameter map");
 
-    match db_name {
-        MaxmindDb::Country => {
+    match db_type {
+        MaxmindDbType::Country => {
             map.insert(
                 ProgramParameters::CountryNodeCount as u8,
                 result.node_count,
@@ -259,7 +263,7 @@ fn update_geoip_map(
             )
             .expect("error in writing country record size to map");
         }
-        MaxmindDb::Asn => {
+        MaxmindDbType::Asn => {
             map.insert(ProgramParameters::AsnNodeCount as u8, result.node_count, 0)
                 .expect("error in writing country node count to map");
             map.insert(
